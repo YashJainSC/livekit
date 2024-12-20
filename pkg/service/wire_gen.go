@@ -9,6 +9,7 @@ package service
 import (
 	"fmt"
 	"github.com/livekit/livekit-server/pkg/agent"
+	"github.com/livekit/livekit-server/pkg/client"
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
@@ -22,6 +23,7 @@ import (
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/protocol/webhook"
 	"github.com/livekit/psrpc"
+	"github.com/nats-io/nats.go"
 	"github.com/pion/turn/v2"
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
@@ -43,7 +45,11 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		return nil, err
 	}
 	nodeID := getNodeID(currentNode)
-	messageBus := getMessageBus(universalClient)
+	conn, err := client.CreateNATSClient(conf)
+	if err != nil {
+		return nil, err
+	}
+	messageBus := getMessageBus(universalClient, conn)
 	signalRelayConfig := getSignalRelayConfig(conf)
 	signalClient, err := routing.NewSignalClient(nodeID, messageBus, signalRelayConfig)
 	if err != nil {
@@ -125,7 +131,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		return nil, err
 	}
 	clientConfigurationManager := createClientConfiguration()
-	client, err := agent.NewAgentClient(messageBus)
+	agentClient, err := agent.NewAgentClient(messageBus)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +139,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 	timedVersionGenerator := utils.NewDefaultTimedVersionGenerator()
 	turnAuthHandler := NewTURNAuthHandler(keyProvider)
 	forwardStats := createForwardStats(conf)
-	roomManager, err := NewLocalRoomManager(conf, objectStore, currentNode, router, roomAllocator, telemetryService, clientConfigurationManager, client, agentStore, rtcEgressLauncher, timedVersionGenerator, turnAuthHandler, messageBus, forwardStats)
+	roomManager, err := NewLocalRoomManager(conf, objectStore, currentNode, router, roomAllocator, telemetryService, clientConfigurationManager, agentClient, agentStore, rtcEgressLauncher, timedVersionGenerator, turnAuthHandler, messageBus, forwardStats)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +165,11 @@ func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routi
 		return nil, err
 	}
 	nodeID := getNodeID(currentNode)
-	messageBus := getMessageBus(universalClient)
+	conn, err := client.CreateNATSClient(conf)
+	if err != nil {
+		return nil, err
+	}
+	messageBus := getMessageBus(universalClient, conn)
 	signalRelayConfig := getSignalRelayConfig(conf)
 	signalClient, err := routing.NewSignalClient(nodeID, messageBus, signalRelayConfig)
 	if err != nil {
@@ -242,10 +252,16 @@ func createStore(rc redis.UniversalClient) ObjectStore {
 	return NewLocalStore()
 }
 
-func getMessageBus(rc redis.UniversalClient) psrpc.MessageBus {
+func getMessageBus(rc redis.UniversalClient, nats2 *nats.Conn) psrpc.MessageBus {
+	if nats2 != nil {
+		logger.Infow("using NATS as message bus")
+		return psrpc.NewNatsMessageBus(nats2)
+	}
 	if rc == nil {
+		logger.Infow("using local bus")
 		return psrpc.NewLocalMessageBus()
 	}
+	logger.Infow("using Redis as message bus")
 	return psrpc.NewRedisMessageBus(rc)
 }
 

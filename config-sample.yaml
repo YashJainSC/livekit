@@ -16,6 +16,13 @@
 # for production setups, this port should be placed behind a load balancer with TLS
 port: 7880
 
+nats:
+  enabled: true
+  cluster_addresses:
+  - "nats://127.0.0.1:4222"
+  - "nats://127.0.0.1:6222"
+  - "nats://127.0.0.1:5222"
+
 # when redis is set, LiveKit will automatically operate in a fully distributed fashion
 # clients could connect to any node and be routed to the same room
 redis:
@@ -49,7 +56,7 @@ redis:
   # - livekit-redis-node-1.livekit-redis-headless:6380
   # And it will use the password key above as cluster password
   # And the db key will not be used due to cluster mode not support it.
-
+development: true
 # WebRTC configuration
 rtc:
   # UDP ports to use for client traffic.

@@ -56,6 +56,7 @@ type Config struct {
 	Prometheus     PrometheusConfig         `yaml:"prometheus,omitempty"`
 	RTC            RTCConfig                `yaml:"rtc,omitempty"`
 	Redis          redisLiveKit.RedisConfig `yaml:"redis,omitempty"`
+	NATS           NATSConfig               `yaml:"nats,omitempty"`
 	Audio          sfu.AudioConfig          `yaml:"audio,omitempty"`
 	Video          VideoConfig              `yaml:"video,omitempty"`
 	Room           RoomConfig               `yaml:"room,omitempty"`
@@ -114,6 +115,11 @@ type RTCConfig struct {
 	DataChannelMaxBufferedAmount uint64 `yaml:"data_channel_max_buffered_amount,omitempty"`
 
 	ForwardStats ForwardStatsConfig `yaml:"forward_stats,omitempty"`
+}
+
+type NATSConfig struct {
+	Enabled          bool     `yaml:"enabled,omitempty"`
+	ClusterAddresses []string `yaml:"cluster_addresses"`
 }
 
 type TURNServer struct {

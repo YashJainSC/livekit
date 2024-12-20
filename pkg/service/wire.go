@@ -19,6 +19,8 @@ package service
 
 import (
 	"fmt"
+	"github.com/livekit/livekit-server/pkg/client"
+	"github.com/nats-io/nats.go"
 	"os"
 
 	"github.com/google/wire"
@@ -46,6 +48,7 @@ import (
 func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*LivekitServer, error) {
 	wire.Build(
 		getNodeID,
+		client.CreateNATSClient,
 		createRedisClient,
 		createStore,
 		wire.Bind(new(ServiceStore), new(ObjectStore)),
@@ -106,6 +109,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 
 func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routing.Router, error) {
 	wire.Build(
+		client.CreateNATSClient,
 		createRedisClient,
 		getNodeID,
 		getMessageBus,
@@ -182,10 +186,16 @@ func createStore(rc redis.UniversalClient) ObjectStore {
 	return NewLocalStore()
 }
 
-func getMessageBus(rc redis.UniversalClient) psrpc.MessageBus {
+func getMessageBus(rc redis.UniversalClient, nats *nats.Conn) psrpc.MessageBus {
+	if nats != nil {
+		logger.Infow("using NATS as message bus")
+		return psrpc.NewNatsMessageBus(nats)
+	}
 	if rc == nil {
+		logger.Infow("using local bus")
 		return psrpc.NewLocalMessageBus()
 	}
+	logger.Infow("using Redis as message bus")
 	return psrpc.NewRedisMessageBus(rc)
 }
 
