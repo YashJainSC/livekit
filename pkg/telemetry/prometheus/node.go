@@ -15,6 +15,7 @@
 package prometheus
 
 import (
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"time"
 
 	"github.com/mackerelio/go-osstat/memory"
@@ -127,6 +128,7 @@ func Init(nodeID string, nodeType livekit.NodeType) error {
 	initRoomStats(nodeID, nodeType)
 	rpc.InitPSRPCStats(prometheus.Labels{"node_id": nodeID, "node_type": nodeType.String()})
 	initQualityStats(nodeID, nodeType)
+	configureGoRuntimeMetrics()
 
 	var err error
 	cpuStats, err = hwstats.NewCPUStats(nil)
@@ -135,6 +137,17 @@ func Init(nodeID string, nodeType livekit.NodeType) error {
 	}
 
 	return nil
+}
+
+func configureGoRuntimeMetrics() {
+	// need to unregister because some set of metrics is added by default
+	// (https://github.com/prometheus/client_golang/blob/64435fc00ac419bb878a3f9c9658e8353c19a7cd/prometheus/registry.go#L63),
+	// but we need more metrics
+	prometheus.Unregister(collectors.NewGoCollector())
+	
+	prometheus.MustRegister(collectors.NewBuildInfoCollector())
+	prometheus.MustRegister(collectors.NewGoCollector(
+		collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsAll)))
 }
 
 func GetUpdatedNodeStats(prev *livekit.NodeStats, prevAverage *livekit.NodeStats) (*livekit.NodeStats, bool, error) {
