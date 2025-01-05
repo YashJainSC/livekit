@@ -38,8 +38,8 @@ type PacketGroupConfig struct {
 }
 
 var (
-	DefaultPacketGroupConfig = PacketGroupConfig{
-		MinPackets:        20,
+	defaultPacketGroupConfig = PacketGroupConfig{
+		MinPackets:        30,
 		MaxWindowDuration: 500 * time.Millisecond,
 	}
 )
@@ -80,35 +80,41 @@ func (s stat) MarshalLogObject(e zapcore.ObjectEncoder) error {
 type classStat struct {
 	primary stat
 	rtx     stat
+	probe   stat
 }
 
-func (c *classStat) add(size int, isRTX bool) {
+func (c *classStat) add(size int, isRTX bool, isProbe bool) {
 	if isRTX {
 		c.rtx.add(size)
+	} else if isProbe {
+		c.probe.add(size)
 	} else {
 		c.primary.add(size)
 	}
 }
 
-func (c *classStat) remove(size int, isRTX bool) {
+func (c *classStat) remove(size int, isRTX bool, isProbe bool) {
 	if isRTX {
 		c.rtx.remove(size)
+	} else if isProbe {
+		c.probe.remove(size)
 	} else {
 		c.primary.remove(size)
 	}
 }
 
 func (c *classStat) numPackets() int {
-	return c.primary.getNumPackets() + c.rtx.getNumPackets()
+	return c.primary.getNumPackets() + c.rtx.getNumPackets() + c.probe.getNumPackets()
 }
 
 func (c *classStat) numBytes() int {
-	return c.primary.getNumBytes() + c.rtx.getNumBytes()
+	return c.primary.getNumBytes() + c.rtx.getNumBytes() + c.probe.getNumBytes()
 }
 
 func (c classStat) MarshalLogObject(e zapcore.ObjectEncoder) error {
 	e.AddObject("primary", c.primary)
 	e.AddObject("rtx", c.rtx)
+	e.AddObject("probe", c.probe)
 	return nil
 }
 
@@ -136,18 +142,18 @@ type packetGroup struct {
 	lost     classStat
 	snBitmap *utils.Bitmap[uint64]
 
-	aggregateSendDelta int64
-	aggregateRecvDelta int64
-	queuingDelay       int64
+	aggregateSendDelta    int64
+	aggregateRecvDelta    int64
+	inheritedQueuingDelay int64
 
 	isFinalized bool
 }
 
-func newPacketGroup(params packetGroupParams, queuingDelay int64) *packetGroup {
+func newPacketGroup(params packetGroupParams, inheritedQueuingDelay int64) *packetGroup {
 	return &packetGroup{
-		params:       params,
-		queuingDelay: queuingDelay,
-		snBitmap:     utils.NewBitmap[uint64](params.Config.MinPackets),
+		params:                params,
+		inheritedQueuingDelay: inheritedQueuingDelay,
+		snBitmap:              utils.NewBitmap[uint64](params.Config.MinPackets),
 	}
 }
 
@@ -175,11 +181,11 @@ func (p *packetGroup) Add(pi *packetInfo, sendDelta, recvDelta int64, isLost boo
 	}
 	p.maxRecvTime = max(p.maxRecvTime, pi.recvTime)
 
-	p.acked.add(int(pi.size), pi.isRTX)
+	p.acked.add(int(pi.size), pi.isRTX, pi.isProbe)
 	if p.snBitmap.IsSet(pi.sequenceNumber - p.minSequenceNumber) {
 		// an earlier packet reported as lost has been received
 		p.snBitmap.Clear(pi.sequenceNumber - p.minSequenceNumber)
-		p.lost.remove(int(pi.size), pi.isRTX)
+		p.lost.remove(int(pi.size), pi.isRTX, pi.isProbe)
 	}
 
 	// note that out-of-order deliveries will amplify the queueing delay.
@@ -212,7 +218,7 @@ func (p *packetGroup) lostPacket(pi *packetInfo) error {
 	p.maxSequenceNumber = max(p.maxSequenceNumber, pi.sequenceNumber)
 	p.snBitmap.Set(pi.sequenceNumber - p.minSequenceNumber)
 
-	p.lost.add(int(pi.size), pi.isRTX)
+	p.lost.add(int(pi.size), pi.isRTX, pi.isProbe)
 	return nil
 }
 
@@ -224,16 +230,24 @@ func (p *packetGroup) SendWindow() (int64, int64) {
 	return p.minSendTime, p.maxSendTime
 }
 
-func (p *packetGroup) PropagatedQueuingDelay() (int64, bool) {
+func (p *packetGroup) PropagatedQueuingDelay() int64 {
+	if p.inheritedQueuingDelay+p.aggregateRecvDelta-p.aggregateSendDelta > 0 {
+		return p.inheritedQueuingDelay + p.aggregateRecvDelta - p.aggregateSendDelta
+	}
+
+	return max(0, p.aggregateRecvDelta-p.aggregateSendDelta)
+}
+
+func (p *packetGroup) FinalizedPropagatedQueuingDelay() (int64, bool) {
 	if !p.isFinalized {
 		return 0, false
 	}
 
-	if p.queuingDelay+p.aggregateRecvDelta-p.aggregateSendDelta > 0 {
-		return p.queuingDelay + p.aggregateRecvDelta - p.aggregateSendDelta, true
-	}
+	return p.PropagatedQueuingDelay(), true
+}
 
-	return max(0, p.aggregateRecvDelta-p.aggregateSendDelta), true
+func (p *packetGroup) IsFinalized() bool {
+	return p.isFinalized
 }
 
 func (p *packetGroup) Traffic() *trafficStats {
@@ -245,6 +259,7 @@ func (p *packetGroup) Traffic() *trafficStats {
 		ackedPackets: p.acked.numPackets(),
 		ackedBytes:   p.acked.numBytes(),
 		lostPackets:  p.lost.numPackets(),
+		lostBytes:    p.lost.numBytes(),
 	}
 }
 
@@ -275,9 +290,8 @@ func (p *packetGroup) MarshalLogObject(e zapcore.ObjectEncoder) error {
 	})
 	ts.Merge(p.Traffic())
 	e.AddObject("trafficStats", ts)
-	e.AddInt64("queuingDelay", p.queuingDelay)
-	pqd, _ := p.PropagatedQueuingDelay()
-	e.AddInt64("propagatedQueuingDelay", pqd)
+	e.AddInt64("inheritedQueuingDelay", p.inheritedQueuingDelay)
+	e.AddInt64("propagatedQueuingDelay", p.PropagatedQueuingDelay())
 
 	e.AddBool("isFinalized", p.isFinalized)
 	return nil

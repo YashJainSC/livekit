@@ -14,7 +14,12 @@
 
 package bwe
 
-import "github.com/pion/rtcp"
+import (
+	"time"
+
+	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
+	"github.com/pion/rtcp"
+)
 
 type NullBWE struct {
 }
@@ -23,11 +28,18 @@ func (n *NullBWE) SetBWEListener(_bweListener BWEListener) {}
 
 func (n *NullBWE) Reset() {}
 
-func (n *NullBWE) Stop() {}
+func (n *NullBWE) RecordPacketSendAndGetSequenceNumber(
+	_atMicro int64,
+	_size int,
+	_isRTX bool,
+	_probeClusterId ccutils.ProbeClusterId,
+	_isProbe bool,
+) uint16 {
+	return 0
+}
 
 func (n *NullBWE) HandleREMB(
 	_receivedEstimate int64,
-	_isProbeFinalizing bool,
 	_expectedBandwidthUsage int64,
 	_sentPackets uint32,
 	_repeatedNacks uint32,
@@ -36,12 +48,30 @@ func (n *NullBWE) HandleREMB(
 
 func (n *NullBWE) HandleTWCCFeedback(_report *rtcp.TransportLayerCC) {}
 
-func (n *NullBWE) ProbingStart(_expectedBandwidthUsage int64) {}
+func (n *NullBWE) UpdateRTT(rtt float64) {}
 
-func (n *NullBWE) ProbingEnd(_isNotFailing bool, _isGoalReached bool) {}
+func (n *NullBWE) CongestionState() CongestionState {
+	return CongestionStateNone
+}
 
-func (n *NullBWE) GetProbeStatus() (bool, ChannelTrend, int64, int64) {
-	return false, ChannelTrendNeutral, 0, 0
+func (n *NullBWE) CanProbe() bool {
+	return false
+}
+
+func (n *NullBWE) ProbeDuration() time.Duration {
+	return 0
+}
+
+func (n *NullBWE) ProbeClusterStarting(_pci ccutils.ProbeClusterInfo) {}
+
+func (n *NullBWE) ProbeClusterDone(_pci ccutils.ProbeClusterInfo) {}
+
+func (n *NullBWE) ProbeClusterIsGoalReached() bool {
+	return false
+}
+
+func (n *NullBWE) ProbeClusterFinalize() (ccutils.ProbeSignal, int64, bool) {
+	return ccutils.ProbeSignalInconclusive, 0, false
 }
 
 // ------------------------------------------------

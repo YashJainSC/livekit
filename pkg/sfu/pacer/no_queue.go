@@ -19,7 +19,7 @@ import (
 
 	"github.com/frostbyte73/core"
 	"github.com/gammazero/deque"
-	"github.com/livekit/livekit-server/pkg/sfu/bwe/sendsidebwe"
+	"github.com/livekit/livekit-server/pkg/sfu/bwe"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -34,13 +34,13 @@ type NoQueue struct {
 	stop    core.Fuse
 }
 
-func NewNoQueue(logger logger.Logger, sendSideBWE *sendsidebwe.SendSideBWE) *NoQueue {
+func NewNoQueue(logger logger.Logger, bwe bwe.BWE) *NoQueue {
 	n := &NoQueue{
-		Base:   NewBase(logger, sendSideBWE),
+		Base:   NewBase(logger, bwe),
 		logger: logger,
 		wake:   make(chan struct{}, 1),
 	}
-	n.packets.SetMinCapacity(9)
+	n.packets.SetBaseCap(512)
 
 	go n.sendWorker()
 	return n
@@ -48,6 +48,11 @@ func NewNoQueue(logger logger.Logger, sendSideBWE *sendsidebwe.SendSideBWE) *NoQ
 
 func (n *NoQueue) Stop() {
 	n.stop.Break()
+
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (n *NoQueue) Enqueue(p *Packet) {

@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/mitchellh/go-homedir"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
@@ -85,6 +85,7 @@ type RTCConfig struct {
 
 	TURNServers []TURNServer `yaml:"turn_servers,omitempty"`
 
+	// Deprecated
 	StrictACKs bool `yaml:"strict_acks,omitempty"`
 
 	// Deprecated: use PacketBufferSizeVideo and PacketBufferSizeAudio
@@ -111,8 +112,12 @@ type RTCConfig struct {
 	// force a reconnect on a data channel error
 	ReconnectOnDataChannelError *bool `yaml:"reconnect_on_data_channel_error,omitempty"`
 
-	// max number of bytes to buffer for data channel. 0 means unlimited
+	// Deprecated
 	DataChannelMaxBufferedAmount uint64 `yaml:"data_channel_max_buffered_amount,omitempty"`
+
+	// Threshold of data channel writing to be considered too slow, data packet could
+	// be dropped for a slow data channel to avoid blocking the room.
+	DatachannelSlowThreshold int `yaml:"datachannel_slow_threshold,omitempty"`
 
 	ForwardStats ForwardStatsConfig `yaml:"forward_stats,omitempty"`
 }
@@ -317,7 +322,6 @@ var DefaultConfig = Config{
 		PacketBufferSize:      500,
 		PacketBufferSizeVideo: 500,
 		PacketBufferSizeAudio: 200,
-		StrictACKs:            true,
 		PLIThrottle:           sfu.DefaultPLIThrottleConfig,
 		CongestionControl: CongestionControlConfig{
 			Enabled:                   true,
@@ -339,11 +343,12 @@ var DefaultConfig = Config{
 		AutoCreate: true,
 		EnabledCodecs: []CodecSpec{
 			{Mime: webrtc.MimeTypeOpus},
-			{Mime: "audio/red"},
+			{Mime: sfu.MimeTypeAudioRed},
 			{Mime: webrtc.MimeTypeVP8},
 			{Mime: webrtc.MimeTypeH264},
 			{Mime: webrtc.MimeTypeVP9},
 			{Mime: webrtc.MimeTypeAV1},
+			{Mime: webrtc.MimeTypeRTX},
 		},
 		EmptyTimeout:       5 * 60,
 		DepartureTimeout:   20,

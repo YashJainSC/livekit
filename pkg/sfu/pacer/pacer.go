@@ -18,14 +18,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 type Packet struct {
 	Header             *rtp.Header
+	HeaderSize         int
 	Payload            []byte
 	IsRTX              bool
+	ProbeClusterId     ccutils.ProbeClusterId
+	IsProbe            bool
 	AbsSendTimeExtID   uint8
 	TransportWideExtID uint8
 	WriteStream        webrtc.TrackLocalWriter
@@ -39,6 +43,16 @@ type Pacer interface {
 
 	SetInterval(interval time.Duration)
 	SetBitrate(bitrate int)
+
+	TimeSinceLastSentPacket() time.Duration
+
+	SetPacerProbeObserverListener(listener PacerProbeObserverListener)
+	StartProbeCluster(pci ccutils.ProbeClusterInfo)
+	EndProbeCluster(probeClusterId ccutils.ProbeClusterId) ccutils.ProbeClusterInfo
+}
+
+type PacerProbeObserverListener interface {
+	OnPacerProbeObserverClusterComplete(probeClusterId ccutils.ProbeClusterId)
 }
 
 // ------------------------------------------------

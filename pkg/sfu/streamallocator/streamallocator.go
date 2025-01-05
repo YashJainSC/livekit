@@ -22,7 +22,7 @@ import (
 
 	"github.com/pion/interceptor/pkg/cc"
 	"github.com/pion/rtcp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 	"go.uber.org/atomic"
 
 	"github.com/livekit/protocol/livekit"
@@ -32,6 +32,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/bwe"
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
+	"github.com/livekit/livekit-server/pkg/sfu/pacer"
 	"github.com/livekit/livekit-server/pkg/utils"
 )
 
@@ -49,6 +50,8 @@ const (
 	FlagAllowOvershootInProbe                   = true
 	FlagAllowOvershootInCatchup                 = false
 	FlagAllowOvershootInBoost                   = true
+
+	cRTTPullInterval = 30 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -80,14 +83,14 @@ const (
 	streamAllocatorSignalAllocateAllTracks
 	streamAllocatorSignalAdjustState
 	streamAllocatorSignalEstimate
+	streamAllocatorSignalFeedback
 	streamAllocatorSignalPeriodicPing
+	streamAllocatorSignalProbeClusterSwitch
 	streamAllocatorSignalSendProbe
-	streamAllocatorSignalProbeClusterDone
+	streamAllocatorSignalPacerProbeObserverClusterComplete
 	streamAllocatorSignalResume
 	streamAllocatorSignalSetAllowPause
 	streamAllocatorSignalSetChannelCapacity
-	// STREAM-ALLOCATOR-DATA streamAllocatorSignalNACK
-	// STREAM-ALLOCATOR-DATA streamAllocatorSignalRTCPReceiverReport
 	streamAllocatorSignalCongestionStateChange
 )
 
@@ -101,24 +104,22 @@ func (s streamAllocatorSignal) String() string {
 		return "ADJUST_STATE"
 	case streamAllocatorSignalEstimate:
 		return "ESTIMATE"
+	case streamAllocatorSignalFeedback:
+		return "FEEDBACK"
 	case streamAllocatorSignalPeriodicPing:
 		return "PERIODIC_PING"
+	case streamAllocatorSignalProbeClusterSwitch:
+		return "PROBE_CLUSTER_SWITCH"
 	case streamAllocatorSignalSendProbe:
 		return "SEND_PROBE"
-	case streamAllocatorSignalProbeClusterDone:
-		return "PROBE_CLUSTER_DONE"
+	case streamAllocatorSignalPacerProbeObserverClusterComplete:
+		return "PACER_PROBE_OBSERVER_CLUSTER_COMPLETE"
 	case streamAllocatorSignalResume:
 		return "RESUME"
 	case streamAllocatorSignalSetAllowPause:
 		return "SET_ALLOW_PAUSE"
 	case streamAllocatorSignalSetChannelCapacity:
 		return "SET_CHANNEL_CAPACITY"
-		/* STREAM-ALLOCATOR-DATA
-		case streamAllocatorSignalNACK:
-			return "NACK"
-		case streamAllocatorSignalRTCPReceiverReport:
-			return "RTCP_RECEIVER_REPORT"
-		*/
 	case streamAllocatorSignalCongestionStateChange:
 		return "CONGESTION_STATE_CHANGE"
 	default:
@@ -151,24 +152,37 @@ const (
 )
 
 type StreamAllocatorConfig struct {
-	ProbeMode                        ProbeMode             `yaml:"probe_mode,omitempty"`
-	MinChannelCapacity               int64                 `yaml:"min_channel_capacity,omitempty"`
-	ProbeController                  ProbeControllerConfig `yaml:"probe_controller,omitempty"`
-	DisableEstimationUnmanagedTracks bool                  `yaml:"disable_etimation_unmanaged_tracks,omitempty"`
+	MinChannelCapacity               int64 `yaml:"min_channel_capacity,omitempty"`
+	DisableEstimationUnmanagedTracks bool  `yaml:"disable_etimation_unmanaged_tracks,omitempty"`
+
+	ProbeMode       ProbeMode `yaml:"probe_mode,omitempty"`
+	ProbeOveragePct int64     `yaml:"probe_overage_pct,omitempty"`
+	ProbeMinBps     int64     `yaml:"probe_min_bps,omitempty"`
+
+	PausedMinWait time.Duration `yaml:"paused_min_wait,omitempty"`
 }
 
 var (
 	DefaultStreamAllocatorConfig = StreamAllocatorConfig{
+		MinChannelCapacity:               0,
+		DisableEstimationUnmanagedTracks: false,
+
 		ProbeMode:       ProbeModePadding,
-		ProbeController: DefaultProbeControllerConfig,
+		ProbeOveragePct: 120,
+		ProbeMinBps:     200_000,
+
+		PausedMinWait: 5 * time.Second,
 	}
 )
 
 // ---------------------------------------------------------------------------
 
 type StreamAllocatorParams struct {
-	Config StreamAllocatorConfig
-	Logger logger.Logger
+	Config    StreamAllocatorConfig
+	BWE       bwe.BWE
+	Pacer     pacer.Pacer
+	RTTGetter func() (float64, bool)
+	Logger    logger.Logger
 }
 
 type StreamAllocator struct {
@@ -176,7 +190,6 @@ type StreamAllocator struct {
 
 	onStreamStateChange func(update *StreamStateUpdate) error
 
-	bwe                    bwe.BWE
 	sendSideBWEInterceptor cc.BandwidthEstimator
 
 	enabled    bool
@@ -185,52 +198,49 @@ type StreamAllocator struct {
 	committedChannelCapacity  int64
 	overriddenChannelCapacity int64
 
-	probeController *ProbeController
-
 	prober *ccutils.Prober
-
-	// STREAM-ALLOCATOR-DATA rateMonitor     *RateMonitor
 
 	videoTracksMu        sync.RWMutex
 	videoTracks          map[livekit.TrackID]*Track
 	isAllocateAllPending bool
 	rembTrackingSSRC     uint32
 
-	state           streamAllocatorState
-	congestionState bwe.CongestionState
-	isHolding       bool
+	state streamAllocatorState
+
+	activeProbeClusterId   ccutils.ProbeClusterId
+	activeProbeGoalReached bool
+	activeProbeCongesting  bool
 
 	eventsQueue *utils.TypedOpsQueue[Event]
+
+	lastRTTTime time.Time
 
 	isStopped atomic.Bool
 }
 
 func NewStreamAllocator(params StreamAllocatorParams, enabled bool, allowPause bool) *StreamAllocator {
 	s := &StreamAllocator{
-		params:     params,
-		enabled:    enabled,
-		allowPause: allowPause,
-		prober: ccutils.NewProber(ccutils.ProberParams{
-			Logger: params.Logger,
-		}),
-		// STREAM-ALLOCATOR-DATA rateMonitor: NewRateMonitor(),
-		videoTracks: make(map[livekit.TrackID]*Track),
+		params:               params,
+		enabled:              enabled,
+		allowPause:           allowPause,
+		videoTracks:          make(map[livekit.TrackID]*Track),
+		state:                streamAllocatorStateStable,
+		activeProbeClusterId: ccutils.ProbeClusterIdInvalid,
 		eventsQueue: utils.NewTypedOpsQueue[Event](utils.OpsQueueParams{
 			Name:    "stream-allocator",
 			MinSize: 64,
 			Logger:  params.Logger,
 		}),
+		lastRTTTime: time.Now().Add(-cRTTPullInterval),
 	}
 
-	s.probeController = NewProbeController(ProbeControllerParams{
-		Config: s.params.Config.ProbeController,
-		Prober: s.prober,
-		Logger: params.Logger,
+	s.prober = ccutils.NewProber(ccutils.ProberParams{
+		Listener: s,
+		Logger:   params.Logger,
 	})
 
-	s.resetState()
-
-	s.prober.SetProberListener(s)
+	s.params.BWE.SetBWEListener(s)
+	s.params.Pacer.SetPacerProbeObserverListener(s)
 
 	return s
 }
@@ -247,19 +257,12 @@ func (s *StreamAllocator) Stop() {
 
 	// wait for eventsQueue to be done
 	<-s.eventsQueue.Stop()
-	s.probeController.StopProbe()
+
+	s.maybeStopProbe()
 }
 
 func (s *StreamAllocator) OnStreamStateChange(f func(update *StreamStateUpdate) error) {
 	s.onStreamStateChange = f
-}
-
-func (s *StreamAllocator) SetBWE(bwe bwe.BWE) {
-	if bwe != nil {
-		bwe.SetBWEListener(s)
-	}
-	s.bwe = bwe
-	s.probeController.SetBWE(bwe)
 }
 
 func (s *StreamAllocator) SetSendSideBWEInterceptor(sendSideBWEInterceptor cc.BandwidthEstimator) {
@@ -295,10 +298,7 @@ func (s *StreamAllocator) AddTrack(downTrack *sfu.DownTrack, params AddTrackPara
 	}
 
 	downTrack.SetStreamAllocatorListener(s)
-	if s.prober.IsRunning() {
-		// STREAM-ALLOCATOR-TODO: this can be changed to adapt to probe rate
-		downTrack.SetStreamAllocatorReportInterval(50 * time.Millisecond)
-	}
+	downTrack.SetProbeClusterId(s.activeProbeClusterId)
 
 	s.maybePostEventAllocateTrack(downTrack)
 }
@@ -345,15 +345,6 @@ func (s *StreamAllocator) SetChannelCapacity(channelCapacity int64) {
 	})
 }
 
-func (s *StreamAllocator) resetState() {
-	if s.bwe != nil {
-		s.bwe.Reset()
-	}
-	s.probeController.Reset()
-
-	s.state = streamAllocatorStateStable
-}
-
 // called when a new REMB is received (receive side bandwidth estimation)
 func (s *StreamAllocator) OnREMB(downTrack *sfu.DownTrack, remb *rtcp.ReceiverEstimatedMaximumBitrate) {
 	//
@@ -386,10 +377,12 @@ func (s *StreamAllocator) OnREMB(downTrack *sfu.DownTrack, remb *rtcp.ReceiverEs
 		return
 	}
 
-	track := s.videoTracks[livekit.TrackID(downTrack.ID())]
 	downTrackSSRC := uint32(0)
+	downTrackSSRCRTX := uint32(0)
+	track := s.videoTracks[livekit.TrackID(downTrack.ID())]
 	if track != nil {
 		downTrackSSRC = track.DownTrack().SSRC()
+		downTrackSSRCRTX = track.DownTrack().SSRCRTX()
 	}
 
 	found := false
@@ -407,13 +400,22 @@ func (s *StreamAllocator) OnREMB(downTrack *sfu.DownTrack, remb *rtcp.ReceiverEs
 		}
 
 		// try to lock to track which is sending this update
-		if downTrackSSRC != 0 {
-			for _, ssrc := range remb.SSRCs {
-				if ssrc == downTrackSSRC {
-					s.rembTrackingSSRC = downTrackSSRC
-					found = true
-					break
-				}
+		downTrackSSRC := track.DownTrack().SSRC()
+		downTrackSSRCRTX := track.DownTrack().SSRCRTX()
+		for _, ssrc := range remb.SSRCs {
+			if ssrc == 0 {
+				continue
+			}
+
+			if ssrc == downTrackSSRC {
+				s.rembTrackingSSRC = downTrackSSRC
+				found = true
+				break
+			}
+			if ssrc == downTrackSSRCRTX {
+				s.rembTrackingSSRC = downTrackSSRCRTX
+				found = true
+				break
 			}
 		}
 
@@ -422,7 +424,7 @@ func (s *StreamAllocator) OnREMB(downTrack *sfu.DownTrack, remb *rtcp.ReceiverEs
 		}
 	}
 
-	if s.rembTrackingSSRC == 0 || s.rembTrackingSSRC != downTrackSSRC {
+	if s.rembTrackingSSRC == 0 || (s.rembTrackingSSRC != downTrackSSRC && s.rembTrackingSSRC != downTrackSSRCRTX) {
 		s.videoTracksMu.Unlock()
 		return
 	}
@@ -436,13 +438,10 @@ func (s *StreamAllocator) OnREMB(downTrack *sfu.DownTrack, remb *rtcp.ReceiverEs
 
 // called when a new transport-cc feedback is received
 func (s *StreamAllocator) OnTransportCCFeedback(downTrack *sfu.DownTrack, fb *rtcp.TransportLayerCC) {
-	if s.sendSideBWEInterceptor != nil {
-		s.sendSideBWEInterceptor.WriteRTCP([]rtcp.Packet{fb}, nil)
-	}
-
-	if s.bwe != nil {
-		s.bwe.HandleTWCCFeedback(fb)
-	}
+	s.postEvent(Event{
+		Signal: streamAllocatorSignalFeedback,
+		Data:   fb,
+	})
 }
 
 // called when target bitrate changes (send side bandwidth estimation)
@@ -455,18 +454,16 @@ func (s *StreamAllocator) onTargetBitrateChange(bitrate int) {
 
 // called when congestion state changes (send side bandwidth estimation)
 type congestionStateChangeData struct {
-	congestionState                   bwe.CongestionState
+	fromState                         bwe.CongestionState
+	toState                           bwe.CongestionState
 	estimatedAvailableChannelCapacity int64
 }
 
 // BWEListener implementation
-func (s *StreamAllocator) OnCongestionStateChange(congestionState bwe.CongestionState, estimatedAvailableChannelCapacity int64) {
+func (s *StreamAllocator) OnCongestionStateChange(fromState bwe.CongestionState, toState bwe.CongestionState, estimatedAvailableChannelCapacity int64) {
 	s.postEvent(Event{
 		Signal: streamAllocatorSignalCongestionStateChange,
-		Data: congestionStateChangeData{
-			congestionState:                   congestionState,
-			estimatedAvailableChannelCapacity: estimatedAvailableChannelCapacity,
-		},
+		Data:   congestionStateChangeData{fromState, toState, estimatedAvailableChannelCapacity},
 	})
 }
 
@@ -522,31 +519,13 @@ func (s *StreamAllocator) OnResume(downTrack *sfu.DownTrack) {
 	})
 }
 
-// called by a video DownTrack to report packet send
-func (s *StreamAllocator) OnPacketsSent(downTrack *sfu.DownTrack, size int) {
-	s.prober.PacketsSent(size)
-}
-
-/* STREAM-ALLOCATOR-DATA
-// called by a video DownTrack when it processes NACKs
-func (s *StreamAllocator) OnNACK(downTrack *sfu.DownTrack, nackInfos []sfu.NackInfo) {
+// called when probe cluster changes
+func (s *StreamAllocator) OnProbeClusterSwitch(pci ccutils.ProbeClusterInfo) {
 	s.postEvent(Event{
-		Signal:  streamAllocatorSignalNACK,
-		TrackID: livekit.TrackID(downTrack.ID()),
-		Data:    nackInfos,
+		Signal: streamAllocatorSignalProbeClusterSwitch,
+		Data:   pci,
 	})
 }
-
-// called by a video DownTrack when it receives an RTCP Receiver Report
-// STREAM-ALLOCATOR-TODO: this should probably be done for audio tracks also
-func (s *StreamAllocator) OnRTCPReceiverReport(downTrack *sfu.DownTrack, rr rtcp.ReceptionReport) {
-	s.postEvent(Event{
-		Signal:  streamAllocatorSignalRTCPReceiverReport,
-		TrackID: livekit.TrackID(downTrack.ID()),
-		Data:    rr,
-	})
-}
-*/
 
 // called when prober wants to send packet(s)
 func (s *StreamAllocator) OnSendProbe(bytesToSend int) {
@@ -556,24 +535,12 @@ func (s *StreamAllocator) OnSendProbe(bytesToSend int) {
 	})
 }
 
-// called when prober finishes a probe cluster, could be called when prober is reset which stops an active cluster
-func (s *StreamAllocator) OnProbeClusterDone(info ccutils.ProbeClusterInfo) {
+// called when pacer probe observer observes a cluster completion
+func (s *StreamAllocator) OnPacerProbeObserverClusterComplete(probeClusterId ccutils.ProbeClusterId) {
 	s.postEvent(Event{
-		Signal: streamAllocatorSignalProbeClusterDone,
-		Data:   info,
+		Signal: streamAllocatorSignalPacerProbeObserverClusterComplete,
+		Data:   probeClusterId,
 	})
-}
-
-// called when prober active state changes
-func (s *StreamAllocator) OnActiveChanged(isActive bool) {
-	for _, t := range s.getTracks() {
-		if isActive {
-			// STREAM-ALLOCATOR-TODO: this can be changed to adapt to probe rate
-			t.DownTrack().SetStreamAllocatorReportInterval(50 * time.Millisecond)
-		} else {
-			t.DownTrack().ClearStreamAllocatorReportInterval()
-		}
-	}
 }
 
 // called to check if track should participate in BWE
@@ -648,24 +615,22 @@ func (s *StreamAllocator) postEvent(event Event) {
 			event.handleSignalAdjustState(event)
 		case streamAllocatorSignalEstimate:
 			event.handleSignalEstimate(event)
+		case streamAllocatorSignalFeedback:
+			event.handleSignalFeedback(event)
 		case streamAllocatorSignalPeriodicPing:
 			event.handleSignalPeriodicPing(event)
+		case streamAllocatorSignalProbeClusterSwitch:
+			event.handleSignalProbeClusterSwitch(event)
 		case streamAllocatorSignalSendProbe:
 			event.handleSignalSendProbe(event)
-		case streamAllocatorSignalProbeClusterDone:
-			event.handleSignalProbeClusterDone(event)
+		case streamAllocatorSignalPacerProbeObserverClusterComplete:
+			event.handleSignalPacerProbeObserverClusterComplete(event)
 		case streamAllocatorSignalResume:
 			event.handleSignalResume(event)
 		case streamAllocatorSignalSetAllowPause:
 			event.handleSignalSetAllowPause(event)
 		case streamAllocatorSignalSetChannelCapacity:
 			event.handleSignalSetChannelCapacity(event)
-			/* STREAM-ALLOCATOR-DATA
-			case streamAllocatorSignalNACK:
-				event.s.handleSignalNACK(event)
-			case streamAllocatorSignalRTCPReceiverReport:
-				event.s.handleSignalRTCPReceiverReport(event)
-			*/
 		case streamAllocatorSignalCongestionStateChange:
 			s.handleSignalCongestionStateChange(event)
 		}
@@ -700,33 +665,68 @@ func (s *StreamAllocator) handleSignalAdjustState(Event) {
 }
 
 func (s *StreamAllocator) handleSignalEstimate(event Event) {
-	receivedEstimate, _ := event.Data.(int64)
+	receivedEstimate := event.Data.(int64)
 
 	// always update NACKs
 	packetDelta, repeatedNackDelta := s.getNackDelta()
 
-	if s.bwe != nil {
-		s.bwe.HandleREMB(
-			receivedEstimate,
-			s.probeController.DoesProbeNeedFinalize(), // waiting for goal reached OR aborted probe to finalize
-			s.getExpectedBandwidthUsage(),
-			packetDelta,
-			repeatedNackDelta,
-		)
+	s.params.BWE.HandleREMB(
+		receivedEstimate,
+		s.getExpectedBandwidthUsage(),
+		packetDelta,
+		repeatedNackDelta,
+	)
+}
+
+func (s *StreamAllocator) handleSignalFeedback(event Event) {
+	fb := event.Data.(*rtcp.TransportLayerCC)
+	if s.sendSideBWEInterceptor != nil {
+		s.sendSideBWEInterceptor.WriteRTCP([]rtcp.Packet{fb}, nil)
 	}
+
+	s.params.BWE.HandleTWCCFeedback(fb)
 }
 
 func (s *StreamAllocator) handleSignalPeriodicPing(Event) {
-	// finalize probe if necessary
-	if s.bwe != nil {
-		isValidSignal, trend, lowestEstimate, highestEstimate := s.bwe.GetProbeStatus()
-		isHandled, isNotFailing, isGoalReached := s.probeController.MaybeFinalizeProbe(
-			isValidSignal,
-			trend,
-			lowestEstimate,
-		)
-		if isHandled {
-			s.onProbeDone(isNotFailing, isGoalReached, highestEstimate)
+	// if pause is allowed, there may be no packets sent and BWE could be in congested state,
+	// reset BWE if that persists for a while
+	if s.allowPause && s.state == streamAllocatorStateDeficient && s.params.BWE.CongestionState() != bwe.CongestionStateNone && s.params.Pacer.TimeSinceLastSentPacket() > s.params.Config.PausedMinWait {
+		s.params.Logger.Infow("stream allocator: resetting bwe to enable probing")
+		s.maybeStopProbe()
+		s.params.BWE.Reset()
+
+		// as BWE is reset, there is no finalizing for active cluster, so reset active cluster id
+		s.activeProbeClusterId = ccutils.ProbeClusterIdInvalid
+	}
+
+	if s.activeProbeClusterId != ccutils.ProbeClusterIdInvalid {
+		if !s.activeProbeCongesting && !s.activeProbeGoalReached && s.params.BWE.ProbeClusterIsGoalReached() {
+			s.params.Logger.Debugw(
+				"stream allocator: probe goal reached",
+				"activeProbeClusterId", s.activeProbeClusterId,
+			)
+			s.activeProbeGoalReached = true
+			s.maybeStopProbe()
+		}
+
+		// finalize any probe that may have finished/aborted
+		if probeSignal, channelCapacity, isFinalized := s.params.BWE.ProbeClusterFinalize(); isFinalized {
+			s.params.Logger.Debugw(
+				"stream allocator: probe result",
+				"activeProbeClusterId", s.activeProbeClusterId,
+				"probeSignal", probeSignal,
+				"channelCapacity", channelCapacity,
+			)
+
+			s.activeProbeClusterId = ccutils.ProbeClusterIdInvalid
+
+			if probeSignal != ccutils.ProbeSignalCongesting {
+				if channelCapacity > s.committedChannelCapacity {
+					s.committedChannelCapacity = channelCapacity
+				}
+
+				s.maybeBoostDeficientTracks()
+			}
 		}
 	}
 
@@ -735,10 +735,30 @@ func (s *StreamAllocator) handleSignalPeriodicPing(Event) {
 		s.maybeProbe()
 	}
 
-	/* STREAM-ALLOCATOR-DATA
-	s.monitorRate(s.committedChannelCapacity)
-	s.updateTracksHistory()
-	*/
+	if time.Since(s.lastRTTTime) > cRTTPullInterval {
+		s.lastRTTTime = time.Now()
+
+		if s.params.RTTGetter != nil {
+			if rtt, ok := s.params.RTTGetter(); ok {
+				s.params.BWE.UpdateRTT(rtt)
+			}
+		}
+	}
+}
+
+func (s *StreamAllocator) handleSignalProbeClusterSwitch(event Event) {
+	pci := event.Data.(ccutils.ProbeClusterInfo)
+	s.activeProbeClusterId = pci.Id
+	s.activeProbeGoalReached = false
+	s.activeProbeCongesting = false
+
+	s.params.BWE.ProbeClusterStarting(pci)
+
+	s.params.Pacer.StartProbeCluster(pci)
+
+	for _, t := range s.getTracks() {
+		t.DownTrack().SetProbeClusterId(pci.Id)
+	}
 }
 
 func (s *StreamAllocator) handleSignalSendProbe(event Event) {
@@ -749,7 +769,7 @@ func (s *StreamAllocator) handleSignalSendProbe(event Event) {
 
 	bytesSent := 0
 	for _, track := range s.getTracks() {
-		sent := track.WritePaddingRTP(bytesToSend)
+		sent := track.WriteProbePackets(bytesToSend)
 		bytesSent += sent
 		bytesToSend -= sent
 		if bytesToSend <= 0 {
@@ -757,14 +777,19 @@ func (s *StreamAllocator) handleSignalSendProbe(event Event) {
 		}
 	}
 
-	if bytesSent != 0 {
-		s.prober.ProbeSent(bytesSent)
-	}
+	s.prober.ProbesSent(bytesSent)
 }
 
-func (s *StreamAllocator) handleSignalProbeClusterDone(event Event) {
-	info, _ := event.Data.(ccutils.ProbeClusterInfo)
-	s.probeController.ProbeClusterDone(info)
+func (s *StreamAllocator) handleSignalPacerProbeObserverClusterComplete(event Event) {
+	probeClusterId, _ := event.Data.(ccutils.ProbeClusterId)
+	pci := s.params.Pacer.EndProbeCluster(probeClusterId)
+
+	for _, t := range s.getTracks() {
+		t.DownTrack().SwapProbeClusterId(pci.Id, ccutils.ProbeClusterIdInvalid)
+	}
+
+	s.params.BWE.ProbeClusterDone(pci)
+	s.prober.ClusterDone(pci)
 }
 
 func (s *StreamAllocator) handleSignalResume(event Event) {
@@ -794,87 +819,47 @@ func (s *StreamAllocator) handleSignalSetChannelCapacity(event Event) {
 	}
 }
 
-/* STREAM-ALLOCATOR-DATA
-func (s *StreamAllocator) handleSignalNACK(event Event) {
-	nackInfos := event.Data.([]sfu.NackInfo)
-
-	s.videoTracksMu.Lock()
-	track := s.videoTracks[event.TrackID]
-	s.videoTracksMu.Unlock()
-
-	if track != nil {
-		track.UpdateNack(nackInfos)
-	}
-}
-
-func (s *StreamAllocator) handleSignalRTCPReceiverReport(event Event) {
-	rr := event.Data.(rtcp.ReceptionReport)
-
-	s.videoTracksMu.Lock()
-	track := s.videoTracks[event.TrackID]
-	s.videoTracksMu.Unlock()
-
-	if track != nil {
-		track.ProcessRTCPReceiverReport(rr)
-	}
-}
-*/
-
 func (s *StreamAllocator) handleSignalCongestionStateChange(event Event) {
 	cscd := event.Data.(congestionStateChangeData)
-	if cscd.congestionState != bwe.CongestionStateNone {
-		s.probeController.AbortProbe()
+	if cscd.toState != bwe.CongestionStateNone {
+		// end/abort any running probe if channel is not clear
+		s.maybeStopProbe()
 	}
 
-	if cscd.congestionState == bwe.CongestionStateEarlyWarning ||
-		cscd.congestionState == bwe.CongestionStateEarlyWarningHangover {
-		s.isHolding = true
-	} else {
-		// early warning is done and hold has been released,
-		// if there is no congestion, allocate all tracks optimally as
-		// some tracks may have been held at sub-optimal allocation
-		// during early warning hold
-		if s.isHolding && cscd.congestionState == bwe.CongestionStateNone && s.state == streamAllocatorStateStable {
-			update := NewStreamStateUpdate()
-			for _, track := range s.getTracks() {
-				allocation := track.AllocateOptimal(FlagAllowOvershootWhileOptimal, s.isHolding)
-				updateStreamStateChange(track, allocation, update)
-			}
-			s.maybeSendUpdate(update)
+	// some tracks may have been held at sub-optimal allocation
+	// during early warning hold (if there was one)
+	if isHoldableCongestionState(cscd.fromState) && cscd.toState == bwe.CongestionStateNone && s.state == streamAllocatorStateStable {
+		update := NewStreamStateUpdate()
+		for _, track := range s.getTracks() {
+			allocation := track.AllocateOptimal(FlagAllowOvershootWhileOptimal, false)
+			updateStreamStateChange(track, allocation, update)
 		}
-
-		s.isHolding = false
+		s.maybeSendUpdate(update)
 	}
 
-	if cscd.congestionState == bwe.CongestionStateCongested {
-		s.params.Logger.Infow(
-			"stream allocator: channel congestion detected, updating channel capacity",
-			"old(bps)", s.committedChannelCapacity,
-			"new(bps)", cscd.estimatedAvailableChannelCapacity,
-			"expectedUsage(bps)", s.getExpectedBandwidthUsage(),
-		)
-		/* STREAM-ALLOCATOR-DATA
-		s.params.Logger.Debugw(
-			fmt.Sprintf("stream allocator: channel congestion detected, %s channel capacity: experimental", action),
-			"rateHistory", s.rateMonitor.GetHistory(),
-			"expectedQueuing", s.rateMonitor.GetQueuingGuess(),
-			"trackHistory", s.getTracksHistory(),
-		)
-		*/
-		s.committedChannelCapacity = cscd.estimatedAvailableChannelCapacity
+	if cscd.toState == bwe.CongestionStateCongested {
+		if s.activeProbeClusterId != ccutils.ProbeClusterIdInvalid {
+			if !s.activeProbeCongesting {
+				s.activeProbeCongesting = true
+				s.params.Logger.Infow(
+					"stream allocator: channel congestion detected, not updating channel capacity in active probe",
+					"old(bps)", s.committedChannelCapacity,
+					"new(bps)", cscd.estimatedAvailableChannelCapacity,
+					"expectedUsage(bps)", s.getExpectedBandwidthUsage(),
+				)
+			}
+		} else {
+			s.params.Logger.Infow(
+				"stream allocator: channel congestion detected, updating channel capacity",
+				"old(bps)", s.committedChannelCapacity,
+				"new(bps)", cscd.estimatedAvailableChannelCapacity,
+				"expectedUsage(bps)", s.getExpectedBandwidthUsage(),
+			)
+			s.committedChannelCapacity = cscd.estimatedAvailableChannelCapacity
 
-		// reset probe to ensure it does not start too soon after a downward trend
-		// BWE-TODO: maybe probe controller setting should be algorithm specific
-		// BWE-TODO: for e. g., the reset could be waiting shorter in SSBWE case
-		// BWE-TODO: a couple of things to consider
-		// BWE-TODO:    1. Make ProbeController be owned by BWE modules?
-		// BWE-TODO:    2. Add an interface method to BWE to check if probe controller should be reset?
-		s.probeController.Reset()
-
-		s.allocateAllTracks()
+			s.allocateAllTracks()
+		}
 	}
-
-	s.congestionState = cscd.congestionState
 }
 
 func (s *StreamAllocator) setState(state streamAllocatorState) {
@@ -885,17 +870,13 @@ func (s *StreamAllocator) setState(state streamAllocatorState) {
 	s.params.Logger.Infow("stream allocator: state change", "from", s.state, "to", state)
 	s.state = state
 
-	// reset probe to enforce a delay after state change before probing
-	s.probeController.Reset()
+	// restart everything when state is STABLE
+	if state == streamAllocatorStateStable {
+		s.maybeStopProbe()
 
-	// a fresh start after state transition to get clean data
-	if s.bwe != nil {
-		// BWE-TODO: ssbwe maybe should not reset like this as it might have useful state across
-		// BWE-TODO: state changes in this module, actually even remotebwe should also manage it
-		// BWE-TODO: internally, Reset should probably only be used if all managed tracks go away
-		// BWE-TODO: and we can get a clean start, mimicking existing behaviour till this can be
-		// BWE-TODO: evaluated more.
-		s.bwe.Reset()
+		s.params.BWE.Reset()
+
+		s.activeProbeClusterId = ccutils.ProbeClusterIdInvalid
 	}
 }
 
@@ -911,13 +892,14 @@ func (s *StreamAllocator) adjustState() {
 }
 
 func (s *StreamAllocator) allocateTrack(track *Track) {
-	// abort any probe that may be running when a track specific change needs allocation
-	s.probeController.AbortProbe()
+	// end/abort any probe that may be running when a track specific change needs allocation
+	s.maybeStopProbe()
 
 	// if not deficient, free pass allocate track
-	if !s.enabled || s.state == streamAllocatorStateStable || !track.IsManaged() {
+	bweCongestionState := s.params.BWE.CongestionState()
+	if !s.enabled || (s.state == streamAllocatorStateStable && !isDeficientCongestionState(bweCongestionState)) || !track.IsManaged() {
 		update := NewStreamStateUpdate()
-		allocation := track.AllocateOptimal(FlagAllowOvershootWhileOptimal, s.isHolding)
+		allocation := track.AllocateOptimal(FlagAllowOvershootWhileOptimal, isHoldableCongestionState(bweCongestionState))
 		updateStreamStateChange(track, allocation, update)
 		s.maybeSendUpdate(update)
 		return
@@ -1065,20 +1047,19 @@ func (s *StreamAllocator) allocateTrack(track *Track) {
 	s.adjustState()
 }
 
-func (s *StreamAllocator) onProbeDone(isNotFailing bool, isGoalReached bool, highestEstimate int64) {
-	if s.bwe != nil {
-		s.bwe.ProbingEnd(isNotFailing, isGoalReached)
-	}
-
-	if !isNotFailing {
+func (s *StreamAllocator) maybeStopProbe() {
+	if s.activeProbeClusterId == ccutils.ProbeClusterIdInvalid {
 		return
 	}
 
-	if highestEstimate > s.committedChannelCapacity {
-		s.committedChannelCapacity = highestEstimate
+	pci := s.params.Pacer.EndProbeCluster(s.activeProbeClusterId)
+
+	for _, t := range s.getTracks() {
+		t.DownTrack().SwapProbeClusterId(pci.Id, ccutils.ProbeClusterIdInvalid)
 	}
 
-	s.maybeBoostDeficientTracks()
+	s.params.BWE.ProbeClusterDone(pci)
+	s.prober.Reset(pci)
 }
 
 func (s *StreamAllocator) maybeBoostDeficientTracks() {
@@ -1299,26 +1280,13 @@ func (s *StreamAllocator) getNackDelta() (uint32, uint32) {
 	return aggPacketDelta, aggRepeatedNackDelta
 }
 
-func (s *StreamAllocator) initProbe(probeGoalDeltaBps int64) {
-	expectedBandwidthUsage := s.getExpectedBandwidthUsage()
-	probeClusterId, probeGoalBps := s.probeController.InitProbe(probeGoalDeltaBps, expectedBandwidthUsage)
-	s.params.Logger.Debugw(
-		"stream allocator: starting probe",
-		"probeClusterId", probeClusterId,
-		"current usage", expectedBandwidthUsage,
-		"committed", s.committedChannelCapacity,
-		"probeGoalDeltaBps", probeGoalDeltaBps,
-		"goalBps", probeGoalBps,
-	)
-}
-
 func (s *StreamAllocator) maybeProbe() {
 	if s.overriddenChannelCapacity > 0 {
 		// do not probe if channel capacity is overridden
 		return
 	}
 
-	if s.congestionState != bwe.CongestionStateNone || !s.probeController.CanProbe() {
+	if !s.params.BWE.CanProbe() {
 		return
 	}
 
@@ -1343,7 +1311,7 @@ func (s *StreamAllocator) maybeProbeWithMedia() {
 		updateStreamStateChange(track, allocation, update)
 		s.maybeSendUpdate(update)
 
-		s.probeController.Reset()
+		s.params.BWE.Reset()
 		break
 	}
 }
@@ -1356,7 +1324,25 @@ func (s *StreamAllocator) maybeProbeWithPadding() {
 			continue
 		}
 
-		s.initProbe(transition.BandwidthDelta)
+		// overshoot a bit to account for noise (in measurement/estimate etc)
+		desiredIncreaseBps := (transition.BandwidthDelta * s.params.Config.ProbeOveragePct) / 100
+		if desiredIncreaseBps < s.params.Config.ProbeMinBps {
+			desiredIncreaseBps = s.params.Config.ProbeMinBps
+		}
+		expectedBandwidthUsage := s.getExpectedBandwidthUsage()
+		pci := s.prober.AddCluster(
+			ccutils.ProbeClusterModeUniform,
+			ccutils.ProbeClusterGoal{
+				AvailableBandwidthBps: int(s.committedChannelCapacity),
+				ExpectedUsageBps:      int(expectedBandwidthUsage),
+				DesiredBps:            int(expectedBandwidthUsage + desiredIncreaseBps),
+				Duration:              s.params.BWE.ProbeDuration(),
+			},
+		)
+		s.params.Logger.Debugw(
+			"stream allocator: adding probe",
+			"probeClusterInfo", pci,
+		)
 		break
 	}
 }
@@ -1423,51 +1409,6 @@ func (s *StreamAllocator) getMaxDistanceSortedDeficient() MaxDistanceSorter {
 	return maxDistanceSorter
 }
 
-/* STREAM-ALLOCATOR-DATA
-// STREAM-ALLOCATOR-EXPERIMENTAL-TODO
-// Monitor sent rate vs estimate to figure out queuing on congestion.
-// Idea here is to pause all managed tracks on congestion detection immediately till queue drains.
-// That will allow channel to clear up without more traffic added and a re-allocation can start afresh.
-// Some bits to work out
-//   - how good is queuing estimate?
-//   - should we pause unmanaged tracks also? But, they will restart at highest layer and request a key frame.
-//   - what should be the channel capacity to use when resume re-allocation happens?
-func (s *StreamAllocator) monitorRate(estimate int64) {
-	managedBytesSent := uint32(0)
-	managedBytesRetransmitted := uint32(0)
-	unmanagedBytesSent := uint32(0)
-	unmanagedBytesRetransmitted := uint32(0)
-	for _, track := range s.getTracks() {
-		b, r := track.GetAndResetBytesSent()
-		if track.IsManaged() {
-			managedBytesSent += b
-			managedBytesRetransmitted += r
-		} else {
-			unmanagedBytesSent += b
-			unmanagedBytesRetransmitted += r
-		}
-	}
-
-	s.rateMonitor.Update(estimate, managedBytesSent, managedBytesRetransmitted, unmanagedBytesSent, unmanagedBytesRetransmitted)
-}
-
-func (s *StreamAllocator) updateTracksHistory() {
-	for _, track := range s.getTracks() {
-		track.UpdateHistory()
-	}
-}
-
-func (s *StreamAllocator) getTracksHistory() map[livekit.TrackID]string {
-	tracks := s.getTracks()
-	history := make(map[livekit.TrackID]string, len(tracks))
-	for _, track := range tracks {
-		history[track.ID()] = track.GetHistory()
-	}
-
-	return history
-}
-*/
-
 // ------------------------------------------------
 
 func updateStreamStateChange(track *Track, allocation sfu.VideoAllocation, update *StreamStateUpdate) {
@@ -1489,6 +1430,14 @@ func updateStreamStateChange(track *Track, allocation sfu.VideoAllocation, updat
 	if updated {
 		update.HandleStreamingChange(track, streamState)
 	}
+}
+
+func isHoldableCongestionState(bweCongestionState bwe.CongestionState) bool {
+	return bweCongestionState == bwe.CongestionStateEarlyWarning
+}
+
+func isDeficientCongestionState(bweCongestionState bwe.CongestionState) bool {
+	return bweCongestionState == bwe.CongestionStateCongested
 }
 
 // ------------------------------------------------

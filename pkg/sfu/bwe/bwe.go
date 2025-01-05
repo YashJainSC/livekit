@@ -16,8 +16,17 @@ package bwe
 
 import (
 	"fmt"
+	"time"
 
+	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/pion/rtcp"
+)
+
+// ------------------------------------------------
+
+const (
+	DefaultRTT         = float64(0.070) // 70 ms
+	RTTSmoothingFactor = float64(0.5)
 )
 
 // ------------------------------------------------
@@ -27,9 +36,7 @@ type CongestionState int
 const (
 	CongestionStateNone CongestionState = iota
 	CongestionStateEarlyWarning
-	CongestionStateEarlyWarningHangover
 	CongestionStateCongested
-	CongestionStateCongestedHangover
 )
 
 func (c CongestionState) String() string {
@@ -38,35 +45,8 @@ func (c CongestionState) String() string {
 		return "NONE"
 	case CongestionStateEarlyWarning:
 		return "EARLY_WARNING"
-	case CongestionStateEarlyWarningHangover:
-		return "EARLY_WARNING_HANGOVER"
 	case CongestionStateCongested:
 		return "CONGESTED"
-	case CongestionStateCongestedHangover:
-		return "CONGESTED_HANGOVER"
-	default:
-		return fmt.Sprintf("%d", int(c))
-	}
-}
-
-// ------------------------------------------------
-
-type ChannelTrend int
-
-const (
-	ChannelTrendNeutral ChannelTrend = iota
-	ChannelTrendClearing
-	ChannelTrendCongesting
-)
-
-func (c ChannelTrend) String() string {
-	switch c {
-	case ChannelTrendNeutral:
-		return "NEUTRAL"
-	case ChannelTrendClearing:
-		return "CLEARING"
-	case ChannelTrendCongesting:
-		return "CONGESTING"
 	default:
 		return fmt.Sprintf("%d", int(c))
 	}
@@ -79,27 +59,40 @@ type BWE interface {
 
 	Reset()
 
-	Stop()
-
 	HandleREMB(
 		receivedEstimate int64,
-		isProbeFinalizing bool,
 		expectedBandwidthUsage int64,
 		sentPackets uint32,
 		repeatedNacks uint32,
 	)
 
+	// TWCC sequence number
+	RecordPacketSendAndGetSequenceNumber(
+		atMicro int64,
+		size int,
+		isRTX bool,
+		probeClusterId ccutils.ProbeClusterId,
+		isProbe bool,
+	) uint16
+
 	HandleTWCCFeedback(report *rtcp.TransportLayerCC)
 
-	ProbingStart(expectedBandwidthUsage int64)
-	ProbingEnd(isNotFailing bool, isGoalReached bool)
-	GetProbeStatus() (isValidSignal bool, trend ChannelTrend, lowestEstimate int64, highestEstimate int64)
+	UpdateRTT(rtt float64)
+
+	CongestionState() CongestionState
+
+	CanProbe() bool
+	ProbeDuration() time.Duration
+	ProbeClusterStarting(pci ccutils.ProbeClusterInfo)
+	ProbeClusterDone(pci ccutils.ProbeClusterInfo)
+	ProbeClusterIsGoalReached() bool
+	ProbeClusterFinalize() (ccutils.ProbeSignal, int64, bool)
 }
 
 // ------------------------------------------------
 
 type BWEListener interface {
-	OnCongestionStateChange(congestionState CongestionState, estimatedAvailableChannelCapacity int64)
+	OnCongestionStateChange(fromState CongestionState, toState CongestionState, estimatedAvailableChannelCapacity int64)
 }
 
 // ------------------------------------------------

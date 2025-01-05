@@ -66,7 +66,6 @@ func newTWCCFeedback(params twccFeedbackParams) *twccFeedback {
 }
 
 func (t *twccFeedback) ProcessReport(report *rtcp.TransportLayerCC, at time.Time) (int64, bool) {
-	// SSBWE-REMOVE t.params.Logger.Infow("TWCC feedback", "report", report.String()) // SSBWE-REMOVE
 	t.numReports++
 	if t.lastFeedbackTime.IsZero() {
 		t.lastFeedbackTime = at
@@ -99,7 +98,6 @@ func (t *twccFeedback) ProcessReport(report *rtcp.TransportLayerCC, at time.Time
 
 	if !isOutOfOrder {
 		sinceLast := at.Sub(t.lastFeedbackTime)
-		// SSBWE-REMOVE t.params.Logger.Infow("report received", "at", at, "sinceLast", sinceLast, "pktCount", report.FbPktCount) // SSBWE-REMOVE
 		if t.estimatedFeedbackInterval == 0 {
 			t.estimatedFeedbackInterval = sinceLast
 		} else {

@@ -18,10 +18,34 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/livekit/livekit-server/pkg/sfu/bwe"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/livekit/protocol/logger"
 )
+
+// ------------------------------------------------
+
+type channelTrend int
+
+const (
+	channelTrendInconclusive channelTrend = iota
+	channelTrendClearing
+	channelTrendCongesting
+)
+
+func (c channelTrend) String() string {
+	switch c {
+	case channelTrendInconclusive:
+		return "INCONCLUSIVE"
+	case channelTrendClearing:
+		return "CLEARING"
+	case channelTrendCongesting:
+		return "CONGESTING"
+	default:
+		return fmt.Sprintf("%d", int(c))
+	}
+}
 
 // ------------------------------------------------
 
@@ -143,33 +167,36 @@ func (c *channelObserver) GetNackRatio() float64 {
 	return c.nackTracker.GetRatio()
 }
 
-/* REMOTE-BWE-DATA
-func (c *channelObserver) GetNackHistory() []string {
-	return c.nackTracker.GetHistory()
-}
-*/
-
-func (c *channelObserver) GetTrend() (bwe.ChannelTrend, channelCongestionReason) {
+func (c *channelObserver) GetTrend() (channelTrend, channelCongestionReason) {
 	estimateDirection := c.estimateTrend.GetDirection()
 
 	switch {
 	case estimateDirection == ccutils.TrendDirectionDownward:
-		c.logger.Debugw("remote bwe: channel observer: estimate is trending downward", "channel", c)
-		return bwe.ChannelTrendCongesting, channelCongestionReasonEstimate
+		return channelTrendCongesting, channelCongestionReasonEstimate
 
 	case c.nackTracker.IsTriggered():
-		c.logger.Debugw("remote bwe: channel observer: high rate of repeated NACKs", "channel", c)
-		return bwe.ChannelTrendCongesting, channelCongestionReasonLoss
+		return channelTrendCongesting, channelCongestionReasonLoss
 
 	case estimateDirection == ccutils.TrendDirectionUpward:
-		return bwe.ChannelTrendClearing, channelCongestionReasonNone
+		return channelTrendClearing, channelCongestionReasonNone
 	}
 
-	return bwe.ChannelTrendNeutral, channelCongestionReasonNone
+	return channelTrendInconclusive, channelCongestionReasonNone
 }
 
-func (c *channelObserver) String() string {
-	return fmt.Sprintf("name: %s, estimate: {%v}, nack {%v}", c.params.Name, c.estimateTrend, c.nackTracker)
+func (c *channelObserver) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	if c == nil {
+		return nil
+	}
+
+	e.AddString("name", c.params.Name)
+	e.AddObject("estimate", c.estimateTrend)
+	e.AddObject("nack", c.nackTracker)
+
+	channelTrend, channelCongestionReason := c.GetTrend()
+	e.AddString("channelTrend", channelTrend.String())
+	e.AddString("channelCongestionReason", channelCongestionReason.String())
+	return nil
 }
 
 // ------------------------------------------------

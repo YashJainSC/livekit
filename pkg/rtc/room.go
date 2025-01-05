@@ -52,7 +52,7 @@ const (
 	invAudioLevelQuantization = 1.0 / AudioLevelQuantization
 	subscriberUpdateInterval  = 3 * time.Second
 
-	dataForwardLoadBalanceThreshold = 20
+	dataForwardLoadBalanceThreshold = 4
 
 	simulateDisconnectSignalTimeout = 5 * time.Second
 )
@@ -539,8 +539,7 @@ func (r *Room) Join(participant types.LocalParticipant, requestSource routing.Me
 	}
 
 	time.AfterFunc(time.Minute, func() {
-		state := participant.State()
-		if state == livekit.ParticipantInfo_JOINING || state == livekit.ParticipantInfo_JOINED {
+		if !participant.Verify() {
 			r.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonJoinTimeout)
 		}
 	})
@@ -1271,7 +1270,7 @@ func (r *Room) onDataPacket(source types.LocalParticipant, kind livekit.DataPack
 	BroadcastDataPacketForRoom(r, source, kind, dp, r.Logger)
 }
 
-func (r *Room) onMetrics(source types.LocalParticipant, dp *livekit.DataPacket) {
+func (r *Room) onMetrics(source types.Participant, dp *livekit.DataPacket) {
 	BroadcastMetricsForRoom(r, source, dp, r.Logger)
 }
 

@@ -16,6 +16,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/twitchtv/twirp"
@@ -231,10 +232,26 @@ func (s *SIPService) ListSIPInboundTrunk(ctx context.Context, req *livekit.ListS
 		return nil, ErrSIPNotConnected
 	}
 
-	trunks, err := s.store.ListSIPInboundTrunk(ctx)
-	if err != nil {
-		return nil, err
+	var trunks []*livekit.SIPInboundTrunkInfo
+	if len(req.TrunkIds) != 0 {
+		trunks = make([]*livekit.SIPInboundTrunkInfo, len(req.TrunkIds))
+		for i, id := range req.TrunkIds {
+			t, err := s.store.LoadSIPInboundTrunk(ctx, id)
+			if errors.Is(err, ErrSIPTrunkNotFound) {
+				continue // keep nil in slice
+			} else if err != nil {
+				return nil, err
+			}
+			trunks[i] = t
+		}
+	} else {
+		var err error
+		trunks, err = s.store.ListSIPInboundTrunk(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+	trunks = req.FilterSlice(trunks)
 
 	return &livekit.ListSIPInboundTrunkResponse{Items: trunks}, nil
 }
@@ -247,10 +264,26 @@ func (s *SIPService) ListSIPOutboundTrunk(ctx context.Context, req *livekit.List
 		return nil, ErrSIPNotConnected
 	}
 
-	trunks, err := s.store.ListSIPOutboundTrunk(ctx)
-	if err != nil {
-		return nil, err
+	var trunks []*livekit.SIPOutboundTrunkInfo
+	if len(req.TrunkIds) != 0 {
+		trunks = make([]*livekit.SIPOutboundTrunkInfo, len(req.TrunkIds))
+		for i, id := range req.TrunkIds {
+			t, err := s.store.LoadSIPOutboundTrunk(ctx, id)
+			if errors.Is(err, ErrSIPTrunkNotFound) {
+				continue // keep nil in slice
+			} else if err != nil {
+				return nil, err
+			}
+			trunks[i] = t
+		}
+	} else {
+		var err error
+		trunks, err = s.store.ListSIPOutboundTrunk(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+	trunks = req.FilterSlice(trunks)
 
 	return &livekit.ListSIPOutboundTrunkResponse{Items: trunks}, nil
 }
@@ -326,10 +359,26 @@ func (s *SIPService) ListSIPDispatchRule(ctx context.Context, req *livekit.ListS
 		return nil, ErrSIPNotConnected
 	}
 
-	rules, err := s.store.ListSIPDispatchRule(ctx)
-	if err != nil {
-		return nil, err
+	var rules []*livekit.SIPDispatchRuleInfo
+	if len(req.DispatchRuleIds) != 0 {
+		rules = make([]*livekit.SIPDispatchRuleInfo, len(req.DispatchRuleIds))
+		for i, id := range req.DispatchRuleIds {
+			r, err := s.store.LoadSIPDispatchRule(ctx, id)
+			if errors.Is(err, ErrSIPDispatchRuleNotFound) {
+				continue // keep nil in slice
+			} else if err != nil {
+				return nil, err
+			}
+			rules[i] = r
+		}
+	} else {
+		var err error
+		rules, err = s.store.ListSIPDispatchRule(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+	rules = req.FilterSlice(rules)
 
 	return &livekit.ListSIPDispatchRuleResponse{Items: rules}, nil
 }
@@ -358,7 +407,18 @@ func (s *SIPService) DeleteSIPDispatchRule(ctx context.Context, req *livekit.Del
 }
 
 func (s *SIPService) CreateSIPParticipant(ctx context.Context, req *livekit.CreateSIPParticipantRequest) (*livekit.SIPParticipantInfo, error) {
-	unlikelyLogger := logger.GetLogger().WithUnlikelyValues("room", req.RoomName, "sipTrunk", req.SipTrunkId, "toUser", req.SipCallTo)
+	unlikelyLogger := logger.GetLogger().WithUnlikelyValues(
+		"room", req.RoomName,
+		"sipTrunk", req.SipTrunkId,
+		"toUser", req.SipCallTo,
+		"participant", req.ParticipantIdentity,
+	)
+	AppendLogFields(ctx,
+		"room", req.RoomName,
+		"participant", req.ParticipantIdentity,
+		"toUser", req.SipCallTo,
+		"trunkID", req.SipTrunkId,
+	)
 	ireq, err := s.CreateSIPParticipantRequest(ctx, req, "", "", "", "")
 	if err != nil {
 		unlikelyLogger.Errorw("cannot create sip participant request", err)
@@ -370,9 +430,6 @@ func (s *SIPService) CreateSIPParticipant(ctx context.Context, req *livekit.Crea
 		"toHost", ireq.Address,
 	)
 	AppendLogFields(ctx,
-		"room", req.RoomName,
-		"toUser", req.SipCallTo,
-		"trunkID", req.SipTrunkId,
 		"callID", ireq.SipCallId,
 		"fromUser", ireq.Number,
 		"toHost", ireq.Address,
@@ -429,18 +486,24 @@ func (s *SIPService) CreateSIPParticipantRequest(ctx context.Context, req *livek
 }
 
 func (s *SIPService) TransferSIPParticipant(ctx context.Context, req *livekit.TransferSIPParticipantRequest) (*emptypb.Empty, error) {
-	log := logger.GetLogger().WithUnlikelyValues("room", req.RoomName, "participant", req.ParticipantIdentity)
-	ireq, err := s.transferSIPParticipantRequest(ctx, req)
-	if err != nil {
-		log.Errorw("cannot create transfer sip participant request", err)
-		return nil, err
-	}
+	log := logger.GetLogger().WithUnlikelyValues(
+		"room", req.RoomName,
+		"participant", req.ParticipantIdentity,
+		"transferTo", req.TransferTo,
+		"playDialtone", req.PlayDialtone,
+	)
 	AppendLogFields(ctx,
 		"room", req.RoomName,
 		"participant", req.ParticipantIdentity,
 		"transferTo", req.TransferTo,
 		"playDialtone", req.PlayDialtone,
 	)
+
+	ireq, err := s.transferSIPParticipantRequest(ctx, req)
+	if err != nil {
+		log.Errorw("cannot create transfer sip participant request", err)
+		return nil, err
+	}
 
 	timeout := 30 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
