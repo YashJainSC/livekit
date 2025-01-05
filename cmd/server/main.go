@@ -15,6 +15,7 @@
 package main
 
 import (
+	"cloud.google.com/go/profiler"
 	"fmt"
 	"math/rand"
 	"net"
@@ -35,6 +36,8 @@ import (
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/service"
 	"github.com/livekit/livekit-server/version"
+
+	_ "go.uber.org/automaxprocs"
 )
 
 var baseFlags = []cli.Flag{
@@ -252,6 +255,25 @@ func startServer(c *cli.Context) error {
 	err = conf.ValidateKeys()
 	if err != nil {
 		return err
+	}
+
+	profilerEnabled := os.Getenv("ENABLE_PROFILER")
+	if profilerEnabled == "true" {
+		ver := os.Getenv("VERSION")
+		if ver != "" {
+			ver = "v" + ver
+		}
+		cfg := profiler.Config{
+			Service:        "livekit-server",
+			ServiceVersion: ver,
+			ProjectID:      "moj-prod",
+			MutexProfiling: true,
+		}
+
+		// Profiler initialization, best done as early as possible.
+		if err := profiler.Start(cfg); err != nil {
+			logger.Errorw("failed to start profiler", err)
+		}
 	}
 
 	if memProfile := c.String("memprofile"); memProfile != "" {
